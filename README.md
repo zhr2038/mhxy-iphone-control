@@ -33,7 +33,9 @@ arduino-cli board list
 .\phone.ps1 pair-hid
 ```
 
-有多个 Espressif 串口时，在启动服务前设置 `$env:MHXY_SERIAL_PORT = 'COM3'`。首次配对时在 iPhone 的「设置 → 辅助功能 → 触控 → 辅助触控 → 设备 → 蓝牙设备」中选择 `MHXY iPhone HID`。在辅助触控的「指针设备」部分打开「显示屏幕键盘」，连接蓝牙后仍可以手动打字。已配对的板子会重新连回同一部手机。
+有多个 Espressif 串口时，在启动服务前设置 `$env:MHXY_SERIAL_PORT = 'COM3'`。首次配对时在 iPhone 的「设置 → 辅助功能 → 触控 → 辅助触控 → 设备 → 蓝牙设备」中选择 `MHXY iPhone HID`。辅助触控的「指针设备」部分有「显示屏幕键盘」选项。部分应用在蓝牙键盘连接时仍会隐藏软键盘，这时用手动模式。
+
+固件 2.1 上电后默认暂停蓝牙键鼠。已配对时，`begin` 会重连并申请控制权，`finish` 会再次断开键鼠，让 iPhone 恢复触屏输入。也可以单独运行 `pause-hid` 或 `resume-hid`。AirPlay 在暂停期间继续运行。升级固件前备份旧固件。
 
 ## 3. 启动屏幕镜像
 
@@ -60,7 +62,7 @@ uxplay -n MHXY-PC -a -s 332x720 -vrtp 'config-interval=1 ! udpsink host=127.0.0.
 .\phone.ps1 finish --session demo
 ```
 
-首次移动后看镜像中的实际落点，再执行点击。 `home` 归零鼠标，`homescreen` 返回 iOS 主屏幕。`begin --record clip.mp4` 录制，`finish` 停止录制并释放控制权。`ocr --session demo --box 0 0 332 720` 读取指定区域。完整参数见 `phone.ps1 --help`。
+首次移动后看镜像中的实际落点，再执行点击。固件 2.1 按协商后的蓝牙连接间隔发送移动报告，升级后请重新核对指针标定。`home` 归零鼠标，`homescreen` 返回 iOS 主屏幕。`begin --record clip.mp4` 录制，`finish` 停止录制并释放控制权。`ocr --session demo --box 0 0 332 720` 读取指定区域。完整参数见 `phone.ps1 --help`。
 
 安装 Codex Skill 时，把 [对应目录](skills/esp32-iphone-control) 放到自己的 skills 目录，并让调用方使用本仓库的实际路径。它也包含可选的中文备忘录和微信操作配方。配方依赖当前 UI 语言、屏幕布局与本机 OCR，需实地验收。
 

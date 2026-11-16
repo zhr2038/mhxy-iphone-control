@@ -35,6 +35,8 @@ NimBLEAdvertising *advertising;
 std::atomic<uint16_t> connection{noConnection};
 std::atomic<uint8_t> subscribed{0};
 std::atomic<bool> authorized{false}, bonded{false};
+std::atomic<bool> paused{true};
+std::atomic<uint16_t> motionMs{20};
 std::atomic<uint32_t> pairAt{0}, linkGeneration{0}, connectAt{0};
 NimBLEAddress trusted;
 uint32_t heldAt = 0, stateGeneration = 0;
@@ -46,18 +48,33 @@ bool pairing() {
 }
 
 class PeerEvents : public NimBLEServerCallbacks {
+    void trackInterval(const NimBLEConnInfo& info) {
+        // Pace movement reports at the negotiated BLE interval instead of
+        // queueing several movements before iOS receives a connection event.
+        motionMs = constrain((info.getConnInterval() * 5 + 3) / 4 + 2, 10, 35);
+    }
+
     void onConnect(NimBLEServer* server, NimBLEConnInfo& info) override {
-        if (connection != noConnection || (!bonded && !pairing())) {
+        if (paused || connection != noConnection || (!bonded && !pairing())) {
             server->disconnect(info);
             return;
         }
         connection = info.getConnHandle();
         connectAt = millis();
+        trackInterval(info);
         server->updateConnParams(info.getConnHandle(), 12, 18, 0, 400);
+    }
+
+    void onConnParamsUpdate(NimBLEConnInfo& info) override {
+        if (info.getConnHandle() == connection) trackInterval(info);
     }
 
     void onAuthenticationComplete(NimBLEConnInfo& info) override {
         if (info.getConnHandle() != connection) return;
+        if (paused) {
+            NimBLEDevice::getServer()->disconnect(info);
+            return;
+        }
         const auto id = info.getIdAddress();
         if (info.isEncrypted() && info.isBonded()) {
             if (bonded && id == trusted) {
@@ -118,7 +135,7 @@ public:
 };
 
 bool ready(uint8_t bit) {
-    return connection != noConnection && authorized && (subscribed.load() & bit) == bit;
+    return !paused && connection != noConnection && authorized && (subscribed.load() & bit) == bit;
 }
 
 bool notify(NimBLECharacteristic* chr, uint8_t bit, const uint8_t* data, size_t len) {
@@ -209,18 +226,32 @@ String run(String line) {
     int sep = line.indexOf(' ');
     String op = sep < 0 ? line : line.substring(0, sep), arg = sep < 0 ? "" : line.substring(sep + 1);
     if (op == "status") {
-        char out[220];
-        snprintf(out, sizeof(out), "ok {\"fw\":\"mhxy-hid-2\",\"input\":\"ble-hid\",\"usb\":\"serial-only\","
-                 "\"paired\":%s,\"pairing\":%s,\"hid\":\"%s\",\"keyboard\":%s,\"mouse\":%s}",
+        char out[280];
+        snprintf(out, sizeof(out), "ok {\"fw\":\"mhxy-hid-2\",\"build\":\"2.1\",\"input\":\"ble-hid\",\"usb\":\"serial-only\","
+                 "\"paired\":%s,\"pairing\":%s,\"hid\":\"%s\",\"keyboard\":%s,\"mouse\":%s,\"motion_ms\":%u}",
                  bonded ? "true" : "false", pairing() ? "true" : "false",
-                 ready(keyboardBit | mouseBit) ? "ready" : "disconnected",
-                 ready(keyboardBit) ? "true" : "false", ready(mouseBit) ? "true" : "false");
+                 paused ? "paused" : ready(keyboardBit | mouseBit) ? "ready" : "disconnected",
+                 ready(keyboardBit) ? "true" : "false", ready(mouseBit) ? "true" : "false", unsigned(motionMs.load()));
         return out;
     }
     if (op == "ping") return "ok";
+    if (op == "hid" && arg == "pause") {
+        paused = true;
+        pairAt = 0;
+        if (advertising->isAdvertising()) advertising->stop();
+        auto handle = connection.load();
+        if (handle != noConnection) NimBLEDevice::getServer()->disconnect(handle);
+        return "ok";
+    }
+    if (op == "hid" && arg == "resume") {
+        if (!bonded) return "err pair the iPhone first";
+        paused = false;
+        return "ok";
+    }
     if (op == "pair") {
         if (bonded) return "err already paired";
         pairAt = millis() | 1;
+        paused = false;
         return "ok 180";
     }
     const char* failed = "err Bluetooth HID report could not be sent";
@@ -261,7 +292,7 @@ String run(String line) {
         for (int axis = 0; axis < 2; ++axis) {
             for (int i = 0; i < 14; ++i) {
                 if (!(axis ? sendMouse(0, -127) : sendMouse(-127, 0))) return failed;
-                delay(reportDelay);
+                delay(motionMs);
             }
         }
         return "ok";
@@ -300,7 +331,7 @@ String run(String line) {
         if (buttons) heldAt = millis();
         for (int i = 0; i < reports; ++i) {
             if (!sendMouse(horizontal.next(), vertical.next())) return failed;
-            delay(reportDelay);
+            delay(motionMs);
         }
         return "ok";
     }
@@ -352,7 +383,7 @@ void setup() {
 void loop() {
     if (advertising) {
         if (connection == noConnection) {
-            bool shouldAdvertise = bonded || pairing();
+            bool shouldAdvertise = !paused && (bonded || pairing());
             if (shouldAdvertise && !advertising->isAdvertising()) advertising->start();
             else if (!shouldAdvertise && advertising->isAdvertising()) advertising->stop();
         } else if (!authorized && millis() - connectAt > (pairing() ? pairTime : 12000)) {

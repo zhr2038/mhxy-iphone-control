@@ -54,7 +54,7 @@ class Service:
         return {"service": "esp32-iphone-local", "pid": os.getpid(),
                 "connected": b is not None and bool(b.status) and b.error is None,
                 "via": b.via if b else None,
-                "phone": {key: b.status[key] for key in ("fw", "input", "usb", "paired", "pairing", "hid", "keyboard", "mouse") if key in b.status} if b else {},
+                "phone": {key: b.status[key] for key in ("fw", "build", "input", "usb", "paired", "pairing", "hid", "keyboard", "mouse", "motion_ms") if key in b.status} if b else {},
                 "mirror": "mhxy", "live_cache": sample is not None,
                 "video_debug": {"frame_age_ms": round(1000 * (time.monotonic() - sample.captured_at))} if sample else None,
                 "status_age_ms": round((time.monotonic() - b.status_at) * 1000) if b and b.status_at else None,
@@ -69,9 +69,25 @@ class Service:
         if time.monotonic() > self.current["deadline"]:
             raise TimeoutError("Task deadline exceeded")
 
-    async def ensure(self):
+    async def activate_hid(self):
         await self.connect()
+        if self.board.status.get("hid") == "paused":
+            await self.board.command("hid resume", timeout=1.5)
+        if self.board.status.get("paired"):
+            deadline = time.monotonic() + 8
+            while self.board.status.get("hid") != "ready" and time.monotonic() < deadline:
+                await asyncio.sleep(0.2)
+                await self.board.refresh()
         self.check_input()
+
+    async def pause_idle_hid(self):
+        if self.board is None or "build" not in self.board.status:
+            return
+        await self.board.command("hid pause", timeout=1.5)
+        await self.board.refresh()
+
+    async def ensure(self):
+        await self.activate_hid()
         return await self.mhxy_frame()
 
     def check_input(self):
@@ -209,7 +225,7 @@ class Service:
             return {"sent": False}
         await self.board.command("home", timeout=1.5)
         await asyncio.sleep(0.15)
-        await self.board.command(f"move {dx} {dy}", timeout=1.5)
+        await self.board.command(f"move {dx} {dy}", timeout=3)
         await asyncio.sleep(0.15)
         self.check_input()
         if not 0 <= time.monotonic() - frame_at <= 1.10:
@@ -240,7 +256,7 @@ class Service:
             await asyncio.sleep(0.12)
         elif not positioned_at or frame_at <= positioned_at:
             return {"sent": False}
-        await self.board.command(f"move {dx} {dy}", timeout=1.5)
+        await self.board.command(f"move {dx} {dy}", timeout=3)
         self.current["pointer_at"] = time.monotonic()
         return {"sent": True}
 
@@ -264,7 +280,7 @@ class Service:
             return {"sent": False}
         await self.board.command("home", timeout=1.5)
         await asyncio.sleep(0.12)
-        await self.board.command(f"move {dx} {dy}", timeout=1.5)
+        await self.board.command(f"move {dx} {dy}", timeout=3)
         await asyncio.sleep(0.12)
         self.check_input()
         if not 0 <= time.monotonic() - frame_at <= 1.10:
@@ -301,6 +317,10 @@ class Service:
                 result["recording_error"] = str(exc)
             finally:
                 self.recording = None
+        try:
+            await self.pause_idle_hid()
+        except (OSError, RuntimeError, ValueError) as exc:
+            result["hid_pause_error"] = str(exc)
         path = WORK / f"{task['session']}.timing.json"
         path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         result["timing_file"] = str(path)
@@ -325,11 +345,26 @@ class Service:
                 await self.board.command("pair", timeout=1)
                 await self.board.refresh()
                 return {"device": "MHXY iPhone HID", "pairing_seconds": 180, "state": self.health()}
+            if op in {"pause-hid", "resume-hid"}:
+                if self.current:
+                    raise RuntimeError("Finish the active phone session before changing HID mode")
+                await self.connect()
+                if "build" not in self.board.status:
+                    raise RuntimeError("Install firmware build 2.1 for manual keyboard mode")
+                if op == "pause-hid":
+                    await self.pause_idle_hid()
+                else:
+                    await self.activate_hid()
+                return self.health()
             if op == "ensure":
                 if self.current and self.current["session"] != session:
                     raise RuntimeError("Another chat owns the phone")
-                frame = self.save_mhxy(await self.ensure(), WORK / "service-ready.png")
-                return {"state": self.health(), "screenshot": frame}
+                try:
+                    frame = self.save_mhxy(await self.ensure(), WORK / "service-ready.png")
+                    return {"state": self.health(), "screenshot": frame}
+                finally:
+                    if self.current is None:
+                        await self.pause_idle_hid()
             if op == "begin":
                 if self.current:
                     raise RuntimeError("A phone session is already active; finish it before starting another")
@@ -346,13 +381,14 @@ class Service:
                 try:
                     async with asyncio.timeout(limit):
                         if external:
-                            await self.connect()
-                            self.check_input()
+                            await self.activate_hid()
                             frame = None
                         else:
                             sample = await self.ensure()
                             frame = self.save_mhxy(sample, req.get("out") or WORK / "mhxy-ready.png")
                 except Exception as exc:
+                    with contextlib.suppress(OSError, RuntimeError, ValueError):
+                        await self.pause_idle_hid()
                     failure = {"session": session, "started_utc": started_utc, "setup_seconds": round(time.monotonic() - started, 3), "error": str(exc) or type(exc).__name__, "state": self.health()}
                     (WORK / f"{session}.setup-failed.json").write_text(json.dumps(failure, indent=2) + "\n")
                     raise
@@ -381,6 +417,8 @@ class Service:
             if op == "stop":
                 if self.current:
                     raise RuntimeError("Finish the active phone session first")
+                with contextlib.suppress(OSError, RuntimeError, ValueError):
+                    await self.pause_idle_hid()
                 self.stop.set()
                 return {"stopping": True}
             self.check_owner(session)
@@ -500,7 +538,7 @@ def start_service():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["_serve", "start", "status", "probe", "pair-hid", "begin", "finish", "release", "screenshot", "run", "ocr", "recipe", "stop"])
+    parser.add_argument("action", choices=["_serve", "start", "status", "probe", "pair-hid", "pause-hid", "resume-hid", "begin", "finish", "release", "screenshot", "run", "ocr", "recipe", "stop"])
     parser.add_argument("--session")
     parser.add_argument("--out")
     parser.add_argument("--record")
