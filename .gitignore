@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.bin
+*.elf
+*.map
+*.mp4
+*.frame
+*.dpapi
+*.log
+*-profile.json
+.env
